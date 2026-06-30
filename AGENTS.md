@@ -34,7 +34,7 @@ Manages Apache Hadoop HDFS deployments on Kubernetes. Handles creation, configur
 - Run `make test` for unit tests
 - Run `make generate && make manifests` after modifying API types
 - Run `make deploy` to deploy to a cluster (requires kubeconfig)
-- Worktrees are stored under `../.hdfs-operator-worktrees/`
+- Worktrees are stored under `.worktree/` (see [AI Worktree Development Mode](#ai-worktree-development-mode))
 
 ### Testing Requirements
 - Unit tests: `make test` (uses envtest)
