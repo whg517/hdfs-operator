@@ -21,12 +21,13 @@ import (
 
 	commonsv1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/commons/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/utils/ptr"
 )
 
-// A role group that omits storage must receive the default data capacity, so the framework builds
-// the data VolumeClaimTemplate the init containers mount. Without it the StatefulSet pod template
-// is rejected ("volumeMounts...name: Not found: \"data\"").
-func TestGetSpecDefaultsStorage(t *testing.T) {
+// GetSpec passes each role spec through verbatim — it no longer defaults storage. A role opts into
+// a data PVC via its RoleDeclaration.DataVolume, and the framework builds the VolumeClaimTemplate
+// from the effective config.resources.storage (defaulting the capacity to DefaultStorageCapacity).
+func TestGetSpecPassesRolesThrough(t *testing.T) {
 	cr := &HdfsCluster{
 		Spec: HdfsClusterSpec{
 			NameNodes: &NameNodeSpec{RoleSpec: commonsv1alpha1.RoleSpec{
@@ -38,15 +39,13 @@ func TestGetSpecDefaultsStorage(t *testing.T) {
 	}
 
 	spec := cr.GetSpec()
-	got := spec.Roles[NameNodeRoleName].RoleGroups["default"].Config
-	if got == nil || got.Resources == nil || got.Resources.Storage == nil {
-		t.Fatalf("storage was not defaulted: %+v", got)
+	if _, ok := spec.Roles[NameNodeRoleName]; !ok {
+		t.Fatal("namenode role missing from GetSpec()")
 	}
-	want := resource.MustParse(DefaultDataStorageCapacity)
-	if got.Resources.Storage.Capacity.Cmp(want) != 0 {
-		t.Errorf("default capacity = %s, want %s", got.Resources.Storage.Capacity.String(), want.String())
+	// No storage default is stamped in — the group is passed through unchanged.
+	if got := spec.Roles[NameNodeRoleName].RoleGroups["default"].Config; got != nil {
+		t.Errorf("GetSpec should not default the role group config, got %+v", got)
 	}
-
 	// The CR itself must stay untouched (getters must not mutate).
 	if rg := cr.Spec.NameNodes.RoleGroups["default"]; rg.Config != nil {
 		t.Errorf("GetSpec mutated the source CR: %+v", rg.Config)
@@ -61,7 +60,7 @@ func TestGetSpecKeepsExplicitStorage(t *testing.T) {
 				RoleGroups: map[string]commonsv1alpha1.RoleGroupSpec{
 					"default": {Config: &commonsv1alpha1.RoleGroupConfigSpec{
 						Resources: &commonsv1alpha1.ResourcesSpec{
-							Storage: &commonsv1alpha1.StorageResource{Capacity: resource.MustParse("5Gi")},
+							Storage: &commonsv1alpha1.StorageResource{Capacity: ptr.To(resource.MustParse("5Gi"))},
 						},
 					}},
 				},

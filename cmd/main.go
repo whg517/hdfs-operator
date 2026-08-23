@@ -41,6 +41,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	hdfsv1alpha1 "github.com/zncdatadev/hdfs-operator/api/v1alpha1"
+	"github.com/zncdatadev/hdfs-operator/internal/constants"
 	"github.com/zncdatadev/hdfs-operator/internal/controller"
 	"github.com/zncdatadev/hdfs-operator/internal/extensions"
 	"github.com/zncdatadev/hdfs-operator/internal/product"
@@ -196,22 +197,39 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Register the discovery ClusterExtension: it publishes the cluster-level discovery ConfigMap
-	// (client-facing core-site/hdfs-site) after each successful reconcile.
-	common.GetExtensionRegistry().RegisterClusterExtension(extensions.NewDiscoveryExtension())
+	// Register the discovery ClusterExtension on a per-reconciler registry: it publishes the
+	// cluster-level discovery ConfigMap (client-facing core-site/hdfs-site) after each successful
+	// reconcile. The framework moved from a global singleton to a per-call registry (operator-go
+	// #582) so nothing is shared across reconcilers.
+	extensionRegistry := common.NewExtensionRegistry[*hdfsv1alpha1.HdfsCluster]()
+	extensionRegistry.RegisterClusterExtension(extensions.NewDiscoveryExtension())
 
-	// Build the HDFS role group handler (embeds the SDK BaseRoleGroupHandler; the framework
-	// owns resource orchestration) and wire it into the SDK GenericReconciler. The product's
-	// computed config flows through the merge pipeline as the lowest layer via product.ComputeConfig.
+	// Build the HDFS role group handler (embeds the SDK BaseRoleGroupHandler; the framework owns
+	// resource orchestration). The same handler also implements RoleProvider — DeclareRoles states
+	// each role's ports, container name, command, data volume and log producers per reconcile.
 	roleGroupHandler := controller.NewHdfsRoleGroupHandler(mgr.GetScheme())
 	reconcilerCfg := &reconciler.GenericReconcilerConfig[*hdfsv1alpha1.HdfsCluster]{
 		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		// Uncached reader: refreshes the resourceVersion after a conflicting status write, which the
+		// informer cache is too stale to serve.
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
 		//nolint:staticcheck // SDK Recorder uses the old events API; migrate when it exposes GetEventRecorder.
 		Recorder:         mgr.GetEventRecorderFor("hdfs-cluster-controller"),
 		RoleGroupHandler: roleGroupHandler,
-		ProductConfig:    product.ComputeConfig,
-		Prototype:        &hdfsv1alpha1.HdfsCluster{},
+		RoleProvider:     roleGroupHandler,
+		// The product's derived config + JVM opts flow through the merge pipeline as the lowest
+		// layer; any CRD configOverrides / envOverrides always win over it.
+		RoleGroupResolver: reconciler.RoleGroupResolverFunc[*hdfsv1alpha1.HdfsCluster](product.ComputeConfig),
+		// Resolve the product image from spec.image folded over these defaults every reconcile
+		// (operator-go #581), so an operator upgrade moves existing clusters onto the co-released
+		// image; ProductName also drives the app.kubernetes.io/name + version labels.
+		ImageResolution: reconciler.ImageResolution{
+			ProductName: constants.ProductName,
+			Defaults:    constants.ImageDefaults(),
+		},
+		Prototype:         &hdfsv1alpha1.HdfsCluster{},
+		ExtensionRegistry: extensionRegistry,
 	}
 
 	hdfsReconciler, err := reconciler.NewGenericReconciler(reconcilerCfg)

@@ -18,9 +18,7 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"path"
-	"strings"
 
 	"github.com/zncdatadev/operator-go/pkg/config"
 	"github.com/zncdatadev/operator-go/pkg/constant"
@@ -29,7 +27,6 @@ import (
 	"github.com/zncdatadev/operator-go/pkg/reconciler"
 	"github.com/zncdatadev/operator-go/pkg/security"
 	"github.com/zncdatadev/operator-go/pkg/sidecar"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -38,23 +35,20 @@ import (
 	"github.com/zncdatadev/hdfs-operator/internal/constants"
 )
 
-// HdfsRoleGroupHandler builds HDFS role group resources. It embeds the SDK
-// BaseRoleGroupHandler so the framework owns resource orchestration — the ConfigMap (rendered
-// from the merged config, including the product config from product.ComputeConfig), Services,
-// the StatefulSet, and the PDB.
-//
-// NOTE (skeleton): the product-specific pieces HDFS needs beyond the framework defaults —
-// ZKFC sidecar, format-namenode / format-zk / wait-for-namenodes init containers, the
-// discovery ConfigMap, Kerberos/TLS volumes — are reintroduced in later refactor phases via a
-// BuildResources override and the SDK's declarative provisioners.
+// HdfsRoleGroupHandler builds HDFS role group resources. It embeds the SDK BaseRoleGroupHandler
+// (which owns resource orchestration: ConfigMap, Services, StatefulSet, PDB) and also implements
+// reconciler.RoleProvider — DeclareRoles states, per reconcile with the cr in hand, everything a
+// role is made of (ports, primary container name, start command, data volume, log producers). The
+// product-specific pieces the declaration cannot express (init containers, CSI volumes, metrics
+// Service) are added in the BuildResources override.
 type HdfsRoleGroupHandler struct {
 	*reconciler.BaseRoleGroupHandler[*hdfsv1alpha1.HdfsCluster]
 }
 
-// NewHdfsRoleGroupHandler creates the handler and configures the framework defaults for the
-// three HDFS roles.
+// NewHdfsRoleGroupHandler creates the handler. It carries only reconcile-invariant collaborators;
+// everything a role is made of is declared per reconcile by DeclareRoles.
 func NewHdfsRoleGroupHandler(scheme *runtime.Scheme) *HdfsRoleGroupHandler {
-	base := reconciler.NewBaseRoleGroupHandler[*hdfsv1alpha1.HdfsCluster](defaultImage(), scheme)
+	base := reconciler.NewBaseRoleGroupHandler[*hdfsv1alpha1.HdfsCluster](scheme)
 
 	// core-site.xml / hdfs-site.xml are rendered as Hadoop XML by the default formats.
 	base.ConfigGenerator = config.NewMultiFormatConfigGenerator()
@@ -63,42 +57,113 @@ func NewHdfsRoleGroupHandler(scheme *runtime.Scheme) *HdfsRoleGroupHandler {
 	// HDFS reads its config from the Hadoop config dir.
 	base.ConfigMountPath = hdfsv1alpha1.HadoopHome + "/etc/hadoop"
 
-	// Persist role data (NameNode name.dir, JournalNode edits.dir, DataNode data.dir all live
-	// under KubedoopDataDir). The framework builds the VolumeClaimTemplate from the role group's
-	// configured storage and mounts it here.
-	base.StorageMountPath = constant.KubedoopDataDir
-
-	setRolePorts(base)
-	setRoleLogging(base)
-
 	return &HdfsRoleGroupHandler{BaseRoleGroupHandler: base}
 }
 
-// roleContainerNames maps each HDFS role to its primary (daemon) container name. These become
-// both the renamed StatefulSet container and the per-container logging key
-// (logging.containers.<name>) in the CRD.
+// roleContainerNames maps each HDFS role to its primary (daemon) container name. These become both
+// the renamed StatefulSet container and the per-container logging key (logging.containers.<name>).
 var roleContainerNames = map[string]string{
 	hdfsv1alpha1.NameNodeRoleName:    constants.NameNodeContainerName,
 	hdfsv1alpha1.DataNodeRoleName:    constants.DataNodeContainerName,
 	hdfsv1alpha1.JournalNodeRoleName: constants.JournalNodeContainerName,
 }
 
-// setRoleLogging gives each role its own primary container name and declarative log4j logging.
-// The SDK renders a log4j.properties from the merged CRD logging spec into the role group
-// ConfigMap (mounted at HADOOP_CONF_DIR) and, when the Vector agent is enabled, ships the
-// container's log files. Uses the SDK per-role hooks (operator-go #531) since HDFS container
-// names differ per role.
-func setRoleLogging(base *reconciler.BaseRoleGroupHandler[*hdfsv1alpha1.HdfsCluster]) {
-	for role, cname := range roleContainerNames {
-		base.SetRoleMainContainerName(role, cname)
-		base.SetRoleLoggingContainers(role, []productlogging.ContainerLogging{
+// DeclareRoles implements reconciler.RoleProvider: one statement per role, produced once per
+// reconcile pass with the cr in hand (so a port that moves because the CR enabled TLS is computed
+// from THIS cr, not from process-wide handler state).
+func (h *HdfsRoleGroupHandler) DeclareRoles(
+	_ context.Context, _ client.Client, cr *hdfsv1alpha1.HdfsCluster,
+) (reconciler.RoleCatalog, error) {
+	catalog := reconciler.RoleCatalog{}
+	for _, role := range []string{
+		hdfsv1alpha1.NameNodeRoleName,
+		hdfsv1alpha1.DataNodeRoleName,
+		hdfsv1alpha1.JournalNodeRoleName,
+	} {
+		catalog[role] = h.roleDeclaration(cr, role)
+	}
+	return catalog, nil
+}
+
+// roleDeclaration is the per-role statement DeclareRoles returns.
+func (h *HdfsRoleGroupHandler) roleDeclaration(cr *hdfsv1alpha1.HdfsCluster, roleName string) reconciler.RoleDeclaration {
+	cname := roleContainerNames[roleName]
+	containerPorts, servicePorts := rolePorts(roleName)
+	// Under TLS the role also serves HTTPS; expose the port so the listener projects HTTPS_PORT.
+	if tlsOn(cr) {
+		if p := httpsContainerPort(roleName); p != nil {
+			containerPorts = append(containerPorts, *p)
+		}
+	}
+	return reconciler.RoleDeclaration{
+		MainContainerName: cname,
+		// ContainerPorts[0] (the RPC / data-transfer port) backs the framework's generated TCP
+		// readiness probe — HDFS's readiness signal. No liveness probe: operator-go #562 removed
+		// the guessed liveness that killed NameNodes mid-fsimage-load, and TCP is auth-agnostic
+		// where an HTTP web-UI probe would 401 forever under Kerberos SPNEGO.
+		ContainerPorts: containerPorts,
+		ServicePorts:   servicePorts,
+		// The whole entrypoint is a bash script (export the listener address, then exec the daemon);
+		// it goes in Command, not Args, since Args are the user's cliOverrides channel.
+		Command: []string{bashShell, "-c", mainContainerScript(cr, roleName)},
+		// Static env with valueFrom (POD_NAME downward API, the ZOOKEEPER ConfigMap ref, Kerberos
+		// paths). Computed env (HDFS_<ROLE>_OPTS, sized from the resolved memory limit) flows through
+		// ComputeConfig's Contribution.EnvVars instead, which sees the effective config.
+		Env: commonEnv(cr, h.ConfigMountPath),
+		// Every HDFS role persists to KubedoopDataDir; the framework builds the VolumeClaimTemplate
+		// from the effective config.resources.storage (defaulting the capacity) and mounts it here.
+		DataVolume: &reconciler.DataVolume{MountPath: constant.KubedoopDataDir},
+		LogProducers: []productlogging.ContainerLogging{
 			{Container: cname, Framework: productlogging.LoggingFrameworkLog4j},
+		},
+	}
+}
+
+// rolePorts returns the container and service ports for a role. The first container port is the
+// role's "ready" port (RPC for NameNode/JournalNode, data transfer for DataNode); the framework's
+// generated readiness probe targets ContainerPorts[0].
+func rolePorts(roleName string) ([]corev1.ContainerPort, []corev1.ServicePort) {
+	type namedPort struct {
+		name string
+		port int32
+	}
+	byRole := map[string][]namedPort{
+		hdfsv1alpha1.NameNodeRoleName: {
+			{hdfsv1alpha1.RpcName, hdfsv1alpha1.NameNodeRpcPort},
+			{hdfsv1alpha1.HttpName, hdfsv1alpha1.NameNodeHttpPort},
+			{hdfsv1alpha1.MetricName, hdfsv1alpha1.NameNodeMetricPort},
+		},
+		hdfsv1alpha1.DataNodeRoleName: {
+			{hdfsv1alpha1.DataName, hdfsv1alpha1.DataNodeDataPort},
+			{hdfsv1alpha1.HttpName, hdfsv1alpha1.DataNodeHttpPort},
+			{hdfsv1alpha1.IpcName, hdfsv1alpha1.DataNodeIpcPort},
+			{hdfsv1alpha1.MetricName, hdfsv1alpha1.DataNodeMetricPort},
+		},
+		hdfsv1alpha1.JournalNodeRoleName: {
+			{hdfsv1alpha1.RpcName, hdfsv1alpha1.JournalNodeRpcPort},
+			{hdfsv1alpha1.HttpName, hdfsv1alpha1.JournalNodeHttpPort},
+			{hdfsv1alpha1.MetricName, hdfsv1alpha1.JournalNodeMetricPort},
+		},
+	}
+	ports := byRole[roleName]
+	containerPorts := make([]corev1.ContainerPort, 0, len(ports))
+	servicePorts := make([]corev1.ServicePort, 0, len(ports))
+	for _, p := range ports {
+		containerPorts = append(containerPorts, corev1.ContainerPort{
+			Name: p.name, ContainerPort: p.port, Protocol: corev1.ProtocolTCP,
+		})
+		servicePorts = append(servicePorts, corev1.ServicePort{
+			Name: p.name, Port: p.port, Protocol: corev1.ProtocolTCP,
 		})
 	}
+	return containerPorts, servicePorts
 }
 
 // listenerVolumeName is the name of the listener CSI volume mounted on every HDFS pod.
 const listenerVolumeName = "listener"
+
+// bashShell is the shell every HDFS container's entrypoint runs under.
+const bashShell = "/bin/bash"
 
 // newListenerProvisioner declares the per-pod listener volume. cluster-internal is the default
 // class; per-role-group listenerClass overrides are reintroduced in a later phase.
@@ -165,104 +230,46 @@ func kerberosEnabled(cr *hdfsv1alpha1.HdfsCluster) bool {
 		cr.Spec.ClusterConfig.Authentication.Kerberos != nil
 }
 
-// setRolePorts declares the container/service ports for each role.
-func setRolePorts(base *reconciler.BaseRoleGroupHandler[*hdfsv1alpha1.HdfsCluster]) {
-	rolePorts := map[string][]struct {
-		name string
-		port int32
-	}{
-		hdfsv1alpha1.NameNodeRoleName: {
-			{hdfsv1alpha1.RpcName, hdfsv1alpha1.NameNodeRpcPort},
-			{hdfsv1alpha1.HttpName, hdfsv1alpha1.NameNodeHttpPort},
-			{hdfsv1alpha1.MetricName, hdfsv1alpha1.NameNodeMetricPort},
-		},
-		hdfsv1alpha1.DataNodeRoleName: {
-			{hdfsv1alpha1.DataName, hdfsv1alpha1.DataNodeDataPort},
-			{hdfsv1alpha1.HttpName, hdfsv1alpha1.DataNodeHttpPort},
-			{hdfsv1alpha1.IpcName, hdfsv1alpha1.DataNodeIpcPort},
-			{hdfsv1alpha1.MetricName, hdfsv1alpha1.DataNodeMetricPort},
-		},
-		hdfsv1alpha1.JournalNodeRoleName: {
-			{hdfsv1alpha1.RpcName, hdfsv1alpha1.JournalNodeRpcPort},
-			{hdfsv1alpha1.HttpName, hdfsv1alpha1.JournalNodeHttpPort},
-			{hdfsv1alpha1.MetricName, hdfsv1alpha1.JournalNodeMetricPort},
-		},
-	}
-
-	for role, ports := range rolePorts {
-		containerPorts := make([]corev1.ContainerPort, 0, len(ports))
-		servicePorts := make([]corev1.ServicePort, 0, len(ports))
-		for _, p := range ports {
-			containerPorts = append(containerPorts, corev1.ContainerPort{
-				Name:          p.name,
-				ContainerPort: p.port,
-				Protocol:      corev1.ProtocolTCP,
-			})
-			servicePorts = append(servicePorts, corev1.ServicePort{
-				Name:     p.name,
-				Port:     p.port,
-				Protocol: corev1.ProtocolTCP,
-			})
-		}
-		base.SetRoleContainerPorts(role, containerPorts)
-		base.SetRoleServicePorts(role, servicePorts)
-	}
-}
-
-// BuildResources delegates to the framework. Product-specific resources are reintroduced here
-// in later phases (see type doc).
+// BuildResources delegates the bulk to the framework, then adds the product-specific pieces the
+// declarative model cannot express: the CSI volume provisioners (listener/TLS/Kerberos), the init
+// containers / native sidecars, and the per-role metrics Service.
 func (h *HdfsRoleGroupHandler) BuildResources(
 	ctx context.Context,
 	k8sClient client.Client,
 	cr *hdfsv1alpha1.HdfsCluster,
 	buildCtx *reconciler.RoleGroupBuildContext,
 ) (*reconciler.RoleGroupResources, error) {
-	// Register the per-pod listener CSI volume before the framework builds the StatefulSet. The
-	// pod reads its externally reachable address from this mount (used for DataNode registration
-	// and address advertisement). buildCtx.VolumeProviders is per-role/per-reconcile, so this
-	// never accumulates across reconciles.
+	// Per-pod listener CSI volume: the pod reads its externally reachable address from this mount
+	// (DataNode registration + address advertisement). VolumeProviders is per-role/per-reconcile.
 	buildCtx.VolumeProviders = append(buildCtx.VolumeProviders, newListenerProvisioner())
-
-	// Register the TLS secret volume (keystore/truststore) when the CR enables TLS. The secret
-	// provisioner satisfies the same VolumeProvider contract as the listener volume.
 	if p := tlsSecretProvisioner(cr); p != nil {
 		buildCtx.VolumeProviders = append(buildCtx.VolumeProviders, p)
 	}
-
-	// Register the Kerberos secret volume (keytab + krb5.conf) for the role when enabled.
 	if p := kerberosSecretProvisioner(cr, buildCtx.RoleName); p != nil {
 		buildCtx.VolumeProviders = append(buildCtx.VolumeProviders, p)
 	}
 
-	// Register the role's init containers / native sidecars (format-namenode, format-zk, zkfc for
-	// NameNode; wait-for-namenodes for DataNode) so the framework injects them during the build.
-	sm := roleSidecarManager(cr, buildCtx.RoleName, h.ConfigMountPath)
+	// Init containers / native sidecars (format-namenode, format-zk, zkfc for NameNode;
+	// wait-for-namenodes for DataNode) go into the framework-provided manager (always non-nil).
+	registerRoleSidecars(cr, buildCtx.RoleName, h.ConfigMountPath, buildCtx.SidecarManager)
 
-	// The NameNode web UI is fronted by an oauth2-proxy sidecar when OIDC is enabled.
-	if buildCtx.RoleName == hdfsv1alpha1.NameNodeRoleName {
-		oidc, err := oidcSidecar(ctx, k8sClient, cr)
+	// The NameNode web UI is fronted by the framework's oauth2-proxy sidecar when OIDC is enabled.
+	if buildCtx.RoleName == hdfsv1alpha1.NameNodeRoleName && oidcEnabled(cr) {
+		if err := ensureOidcCookieSecret(ctx, k8sClient, cr); err != nil {
+			return nil, err
+		}
+		provider, err := oidcSidecarProvider(ctx, k8sClient, cr)
 		if err != nil {
 			return nil, err
 		}
-		if oidc != nil {
-			if sm == nil {
-				sm = sidecar.NewSidecarManager()
-			}
-			sm.Register(sidecar.NewStaticContainerProvider(*oidc), &sidecar.SidecarConfig{Enabled: true})
+		if provider != nil {
+			buildCtx.SidecarManager.Register(provider, &sidecar.SidecarConfig{Enabled: true})
 		}
-	}
-
-	if sm != nil {
-		buildCtx.SidecarManager = sm
 	}
 
 	resources, err := h.BaseRoleGroupHandler.BuildResources(ctx, k8sClient, cr, buildCtx)
 	if err != nil {
 		return nil, err
-	}
-
-	if resources.StatefulSet != nil {
-		h.applyMainContainer(cr, buildCtx.RoleName, resources.StatefulSet)
 	}
 
 	// Publish the per-role metrics Service so Prometheus can scrape the daemon's /jmx endpoint.
@@ -273,11 +280,10 @@ func (h *HdfsRoleGroupHandler) BuildResources(
 	return resources, nil
 }
 
-// roleSidecarManager returns a SidecarManager carrying the role's init containers and native
-// sidecars, or nil when the role needs none (JournalNode). StaticContainerProvider injects
-// non-restart containers as init containers and RestartPolicy=Always containers as native
-// sidecars.
-func roleSidecarManager(cr *hdfsv1alpha1.HdfsCluster, roleName, confDir string) *sidecar.SidecarManager {
+// registerRoleSidecars registers the role's init containers and native sidecars into the
+// framework-provided SidecarManager. StaticContainerProvider injects non-restart containers as init
+// containers and RestartPolicy=Always containers as native sidecars.
+func registerRoleSidecars(cr *hdfsv1alpha1.HdfsCluster, roleName, confDir string, sm *sidecar.SidecarManager) {
 	var containers []corev1.Container
 	switch roleName {
 	case hdfsv1alpha1.NameNodeRoleName:
@@ -291,77 +297,11 @@ func roleSidecarManager(cr *hdfsv1alpha1.HdfsCluster, roleName, confDir string) 
 			waitForNameNodesContainer(cr, confDir),
 		}
 	default:
-		return nil
+		return
 	}
-
-	sm := sidecar.NewSidecarManager()
 	for _, c := range containers {
 		sm.Register(sidecar.NewStaticContainerProvider(c), &sidecar.SidecarConfig{Enabled: true})
 	}
-	return sm
-}
-
-// applyMainContainer sets the CR-driven image, the common env vars, and the role startup command
-// (which exports the listener address then execs the HDFS daemon) on the primary container.
-func (h *HdfsRoleGroupHandler) applyMainContainer(cr *hdfsv1alpha1.HdfsCluster, roleName string, sts *appsv1.StatefulSet) {
-	containers := sts.Spec.Template.Spec.Containers
-	if len(containers) == 0 {
-		return
-	}
-	c := &containers[0]
-
-	if cr.Spec.Image != nil {
-		if image := cr.Spec.Image.GetImage(constants.ProductName); image != "" {
-			c.Image = image
-			c.ImagePullPolicy = cr.Spec.Image.GetPullPolicy()
-		}
-	}
-
-	c.Env = append(c.Env, commonEnv(cr, h.ConfigMountPath)...)
-	if heap := roleJvmOptsEnv(roleName, c); heap != nil {
-		c.Env = append(c.Env, *heap)
-	}
-	// Under TLS the role also serves HTTPS; expose the port so the listener projects HTTPS_PORT.
-	if tlsOn(cr) {
-		if p := httpsContainerPort(roleName); p != nil {
-			c.Ports = append(c.Ports, *p)
-		}
-	}
-	c.Command = []string{"/bin/bash", "-c"}
-	c.Args = []string{mainContainerScript(cr, roleName)}
-}
-
-// roleOptsEnv maps each role to the Hadoop env var that carries its daemon JVM options.
-var roleOptsEnv = map[string]string{
-	hdfsv1alpha1.NameNodeRoleName:    "HDFS_NAMENODE_OPTS",
-	hdfsv1alpha1.DataNodeRoleName:    "HDFS_DATANODE_OPTS",
-	hdfsv1alpha1.JournalNodeRoleName: "HDFS_JOURNALNODE_OPTS",
-}
-
-// roleJvmOptsEnv builds the role's HDFS_<ROLE>_OPTS env var: the JVM max heap sized from the
-// container's memory limit, plus the jmx_prometheus javaagent that exposes Prometheus metrics on
-// the role's metric port (the jar and per-role rules file are provided by the product image under
-// KubedoopJmxDir). Returns nil for an unknown role or when there is nothing to set.
-func roleJvmOptsEnv(roleName string, c *corev1.Container) *corev1.EnvVar {
-	envName := roleOptsEnv[roleName]
-	if envName == "" {
-		return nil
-	}
-	var opts []string
-	if limit, ok := c.Resources.Limits[corev1.ResourceMemory]; ok && !limit.IsZero() {
-		if heapMi := int64(float64(limit.Value())*hdfsv1alpha1.JvmHeapFactor) / (1024 * 1024); heapMi >= 1 {
-			opts = append(opts, fmt.Sprintf("-Xmx%dm", heapMi))
-		}
-	}
-	if port, ok := roleMetricPorts[roleName]; ok {
-		jar := path.Join(constant.KubedoopJmxDir, "jmx_prometheus_javaagent.jar")
-		cfg := path.Join(constant.KubedoopJmxDir, roleName+".yaml")
-		opts = append(opts, fmt.Sprintf("-javaagent:%s=%d:%s", jar, port, cfg))
-	}
-	if len(opts) == 0 {
-		return nil
-	}
-	return &corev1.EnvVar{Name: envName, Value: strings.Join(opts, " ")}
 }
 
 // commonEnv builds the env vars every HDFS container needs. HADOOP_CONF_DIR points at the path
@@ -397,19 +337,10 @@ func commonEnv(cr *hdfsv1alpha1.HdfsCluster, confDir string) []corev1.EnvVar {
 	return env
 }
 
-// defaultImage is the operator's default HDFS image. The CR's spec.image overrides it per
-// reconcile in BuildResources.
-func defaultImage() string {
-	return fmt.Sprintf("%s/%s:%s-kubedoop%s",
-		constants.DefaultImageRepo,
-		constants.ProductName,
-		constants.DefaultProductVersion,
-		constants.DefaultKubedoopVersion,
-	)
-}
-
-// Ensure interface implementation.
-var _ reconciler.RoleGroupHandler[*hdfsv1alpha1.HdfsCluster] = &HdfsRoleGroupHandler{}
-
-// HdfsCluster exposes its Vector aggregator ConfigMap so the framework wires the Vector sidecar.
-var _ reconciler.VectorAggregatorProvider = &hdfsv1alpha1.HdfsCluster{}
+// Ensure interface implementations.
+var (
+	_ reconciler.RoleGroupHandler[*hdfsv1alpha1.HdfsCluster] = &HdfsRoleGroupHandler{}
+	_ reconciler.RoleProvider[*hdfsv1alpha1.HdfsCluster]     = &HdfsRoleGroupHandler{}
+	// HdfsCluster exposes its Vector aggregator ConfigMap so the framework wires the Vector sidecar.
+	_ reconciler.VectorAggregatorProvider = &hdfsv1alpha1.HdfsCluster{}
+)

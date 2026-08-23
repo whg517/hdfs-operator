@@ -20,11 +20,14 @@ limitations under the License.
 package product
 
 import (
+	"context"
 	"fmt"
 	"path"
 	"slices"
 	"strconv"
 	"strings"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	commonsv1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/commons/v1alpha1"
 	"github.com/zncdatadev/operator-go/pkg/constant"
@@ -53,18 +56,24 @@ const (
 	xmlTrue = "true"
 )
 
-// ComputeConfig is the HDFS ProductConfig hook. It computes core-site.xml / hdfs-site.xml for a
-// role group and returns them as an *OverridesSpec — the same shape users write in the CRD. The
-// SDK merges it as the LOWEST layer, so any value a user sets via configOverrides always wins.
+// ComputeConfig is the HDFS RoleGroupResolver hook. It computes core-site.xml / hdfs-site.xml for a
+// role group plus the daemon's JVM options env, returned as a *reconciler.Contribution. The SDK
+// folds it as the LOWEST layer, so any value a user sets via configOverrides / envOverrides wins.
 //
 // The NameNode HA block (nameservices, per-NameNode rpc/http addresses, the JournalNode quorum
 // shared-edits URI) is emitted for every role, because DataNodes and JournalNodes also need to
 // resolve the NameNodes.
 //
 // Some values are Hadoop ${env.VAR} references (ZOOKEEPER, POD_NAME, POD_ADDRESS, IPC_PORT,
-// DATA_PORT); the corresponding container env vars are wired by the handler's BuildResources
-// (later phase). Kerberos/TLS keys are added in the security phase.
-func ComputeConfig(cr *hdfsv1alpha1.HdfsCluster, roleName, _ string) *commonsv1alpha1.OverridesSpec {
+// DATA_PORT); the corresponding container env vars are declared by the handler's DeclareRoles.
+//
+// The ctx/client parameters satisfy the framework's resolver seam (operator-go #591), which may
+// read live cluster state; HDFS's config is a pure function of the CR + the role group's effective
+// resources (read from rg for JVM heap sizing).
+func ComputeConfig(
+	_ context.Context, _ client.Client, cr *hdfsv1alpha1.HdfsCluster, rg *reconciler.RoleGroupBuildContext,
+) (*reconciler.Contribution, error) {
+	roleName := rg.RoleName
 	overrides := map[string]map[string]string{
 		constants.CoreSiteXML: coreSiteConfig(cr),
 		constants.HdfsSiteXML: hdfsSiteConfig(cr, roleName),
@@ -74,7 +83,52 @@ func ComputeConfig(cr *hdfsv1alpha1.HdfsCluster, roleName, _ string) *commonsv1a
 		overrides[constants.SslServerXML] = sslServerConfig(cr)
 		overrides[constants.SslClientXML] = sslClientConfig(cr)
 	}
-	return &commonsv1alpha1.OverridesSpec{ConfigOverrides: overrides}
+	contribution := &reconciler.Contribution{ConfigOverrides: overrides}
+	if env := jvmOptsEnvVars(roleName, rg.EffectiveConfig()); len(env) > 0 {
+		contribution.EnvVars = env
+	}
+	return contribution, nil
+}
+
+// roleOptsEnvName maps each role to the Hadoop env var carrying its daemon JVM options.
+var roleOptsEnvName = map[string]string{
+	hdfsv1alpha1.NameNodeRoleName:    "HDFS_NAMENODE_OPTS",
+	hdfsv1alpha1.DataNodeRoleName:    "HDFS_DATANODE_OPTS",
+	hdfsv1alpha1.JournalNodeRoleName: "HDFS_JOURNALNODE_OPTS",
+}
+
+// roleMetricPort maps each role to the port its jmx_prometheus javaagent serves metrics on.
+var roleMetricPort = map[string]int32{
+	hdfsv1alpha1.NameNodeRoleName:    hdfsv1alpha1.NameNodeMetricPort,
+	hdfsv1alpha1.DataNodeRoleName:    hdfsv1alpha1.DataNodeMetricPort,
+	hdfsv1alpha1.JournalNodeRoleName: hdfsv1alpha1.JournalNodeMetricPort,
+}
+
+// jvmOptsEnvVars builds HDFS_<ROLE>_OPTS: the JVM max heap sized from the role group's effective
+// memory limit, plus the jmx_prometheus javaagent that exposes Prometheus metrics on the role's
+// metric port (the jar and per-role rules file are provided by the product image under
+// KubedoopJmxDir, rendered via the framework's constant.JMXJavaAgentOpt). Empty for an unknown role
+// or when there is nothing to set; it is folded beneath the user's envOverrides, so the user wins.
+func jvmOptsEnvVars(roleName string, cfg *commonsv1alpha1.RoleGroupConfigSpec) map[string]string {
+	envName := roleOptsEnvName[roleName]
+	if envName == "" {
+		return nil
+	}
+	var opts []string
+	if cfg != nil && cfg.Resources != nil && cfg.Resources.Memory != nil && cfg.Resources.Memory.Limit != nil {
+		if limit := cfg.Resources.Memory.Limit; !limit.IsZero() {
+			if heapMi := int64(float64(limit.Value())*hdfsv1alpha1.JvmHeapFactor) / (1024 * 1024); heapMi >= 1 {
+				opts = append(opts, fmt.Sprintf("-Xmx%dm", heapMi))
+			}
+		}
+	}
+	if port, ok := roleMetricPort[roleName]; ok {
+		opts = append(opts, constant.JMXJavaAgentOpt(port, roleName+".yaml"))
+	}
+	if len(opts) == 0 {
+		return nil
+	}
+	return map[string]string{envName: strings.Join(opts, " ")}
 }
 
 // tlsEnabled reports whether the CR requests TLS.

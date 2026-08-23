@@ -17,67 +17,86 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"strings"
 	"testing"
 
+	"github.com/zncdatadev/operator-go/pkg/constant"
 	"github.com/zncdatadev/operator-go/pkg/productlogging"
 	"github.com/zncdatadev/operator-go/pkg/reconciler"
+	"github.com/zncdatadev/operator-go/pkg/sidecar"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 
 	hdfsv1alpha1 "github.com/zncdatadev/hdfs-operator/api/v1alpha1"
 	"github.com/zncdatadev/hdfs-operator/internal/constants"
 )
 
-func TestRoleJvmOptsEnv(t *testing.T) {
-	withMem := func(q string) *corev1.Container {
-		return &corev1.Container{Resources: corev1.ResourceRequirements{
-			Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(q)},
-		}}
+func TestDeclareRoles(t *testing.T) {
+	h := NewHdfsRoleGroupHandler(runtime.NewScheme())
+	cat, err := h.DeclareRoles(context.Background(), nil, crWithNameNodes())
+	if err != nil {
+		t.Fatalf("DeclareRoles: %v", err)
 	}
-
-	// NameNode with a 2Gi limit: -Xmx (2Gi*0.8/1Mi = 1638) + the jmx javaagent on port 8183.
-	e := roleJvmOptsEnv(hdfsv1alpha1.NameNodeRoleName, withMem("2Gi"))
-	if e == nil || e.Name != "HDFS_NAMENODE_OPTS" {
-		t.Fatalf("namenode opts env = %+v, want HDFS_NAMENODE_OPTS", e)
+	// ContainerPorts[0] is the role's readiness port — the framework generates its TCP probe there.
+	readinessPort := map[string]int32{
+		hdfsv1alpha1.NameNodeRoleName:    hdfsv1alpha1.NameNodeRpcPort,
+		hdfsv1alpha1.DataNodeRoleName:    hdfsv1alpha1.DataNodeDataPort,
+		hdfsv1alpha1.JournalNodeRoleName: hdfsv1alpha1.JournalNodeRpcPort,
 	}
-	if !strings.Contains(e.Value, "-Xmx1638m") {
-		t.Errorf("namenode opts should size heap: %q", e.Value)
-	}
-	if !strings.Contains(e.Value, "-javaagent:/kubedoop/jmx/jmx_prometheus_javaagent.jar=8183:/kubedoop/jmx/namenode.yaml") {
-		t.Errorf("namenode opts should add the jmx javaagent on 8183: %q", e.Value)
-	}
-
-	// No memory limit: no -Xmx, but the javaagent is still added.
-	noMem := roleJvmOptsEnv(hdfsv1alpha1.DataNodeRoleName, &corev1.Container{})
-	if noMem == nil || strings.Contains(noMem.Value, "-Xmx") {
-		t.Errorf("no-limit datanode opts should have the agent but no -Xmx: %+v", noMem)
-	}
-	if !strings.Contains(noMem.Value, "=8082:/kubedoop/jmx/datanode.yaml") {
-		t.Errorf("datanode javaagent should use port 8082: %q", noMem.Value)
-	}
-
-	// Unknown role -> nil.
-	if e := roleJvmOptsEnv("unknown", withMem("2Gi")); e != nil {
-		t.Errorf("unknown role should yield nil, got %+v", e)
+	for role, cname := range roleContainerNames {
+		d, ok := cat[role]
+		if !ok {
+			t.Fatalf("role %q missing from catalog", role)
+		}
+		if d.MainContainerName != cname {
+			t.Errorf("role %q main container = %q, want %q", role, d.MainContainerName, cname)
+		}
+		if len(d.ContainerPorts) == 0 || d.ContainerPorts[0].ContainerPort != readinessPort[role] {
+			t.Errorf("role %q ports[0] = %+v, want %d first", role, d.ContainerPorts, readinessPort[role])
+		}
+		// No explicit probes: readiness is the framework's auto TCP on ports[0], and there is no
+		// liveness (operator-go #562 — a guessed liveness kill during startup is worse than none).
+		if d.ReadinessProbe != nil || d.LivenessProbe != nil {
+			t.Errorf("role %q should declare no explicit probes, got readiness=%v liveness=%v", role, d.ReadinessProbe, d.LivenessProbe)
+		}
+		if d.DataVolume == nil || d.DataVolume.MountPath != constant.KubedoopDataDir {
+			t.Errorf("role %q data volume = %+v, want mountPath %q", role, d.DataVolume, constant.KubedoopDataDir)
+		}
+		if len(d.LogProducers) != 1 || d.LogProducers[0].Container != cname ||
+			d.LogProducers[0].Framework != productlogging.LoggingFrameworkLog4j {
+			t.Errorf("role %q log producers = %+v, want single {%s, log4j}", role, d.LogProducers, cname)
+		}
+		if len(d.Command) < 3 || d.Command[0] != bashShell {
+			t.Errorf("role %q command = %v, want a /bin/bash -c script", role, d.Command)
+		}
+		if envByName(d.Env, "POD_NAME") == nil {
+			t.Errorf("role %q env should include POD_NAME", role)
+		}
 	}
 }
 
-func TestRoleLogging(t *testing.T) {
+// Under TLS the https container port is added after the readiness port, so ports[0] stays the RPC
+// port and the framework's generated readiness probe still targets it.
+func TestDeclareRolesTLSAddsHTTPSPort(t *testing.T) {
 	h := NewHdfsRoleGroupHandler(runtime.NewScheme())
-	for role, cname := range roleContainerNames {
-		if got := h.RoleMainContainerName[role]; got != cname {
-			t.Errorf("role %q main container = %q, want %q", role, got, cname)
-		}
-		lc := h.LoggingProducers(role)
-		if len(lc) != 1 || lc[0].Container != cname || lc[0].Framework != productlogging.LoggingFrameworkLog4j {
-			t.Errorf("role %q logging = %+v, want single {%s, log4j}", role, lc, cname)
+	cr := crWithNameNodes()
+	cr.Spec.ClusterConfig.Authentication = &hdfsv1alpha1.AuthenticationSpec{
+		Tls: &hdfsv1alpha1.TlsSpec{SecretClass: constants.DefaultTlsSecretClass},
+	}
+	cat, _ := h.DeclareRoles(context.Background(), nil, cr)
+	d := cat[hdfsv1alpha1.NameNodeRoleName]
+	if d.ContainerPorts[0].ContainerPort != hdfsv1alpha1.NameNodeRpcPort {
+		t.Errorf("ports[0] should still be the RPC port under TLS, got %d", d.ContainerPorts[0].ContainerPort)
+	}
+	found := false
+	for _, p := range d.ContainerPorts {
+		if p.Name == hdfsv1alpha1.HttpsName && p.ContainerPort == hdfsv1alpha1.NameNodeHttpsPort {
+			found = true
 		}
 	}
-	// A role group with no per-role entry falls back to the (empty) global list.
-	if lc := h.LoggingProducers("unknown"); len(lc) != 0 {
-		t.Errorf("unknown role should have no logging producers, got %+v", lc)
+	if !found {
+		t.Errorf("TLS should add the https port, got %+v", d.ContainerPorts)
 	}
 }
 
@@ -268,7 +287,7 @@ func hasMount(ms []corev1.VolumeMount, name string) bool {
 
 func TestKinitInInitContainers(t *testing.T) {
 	cr := crWithNameNodes()
-	cr.Namespace = "default"
+	cr.Namespace = testNamespace
 
 	// Without Kerberos: no kinit, no kerberos mount.
 	noKrb := formatNameNodeContainer(cr, "/x")
@@ -299,7 +318,7 @@ func TestKinitInInitContainers(t *testing.T) {
 func TestMetricsService(t *testing.T) {
 	buildCtx := &reconciler.RoleGroupBuildContext{
 		ClusterName:      "simple-hdfs",
-		ClusterNamespace: "default",
+		ClusterNamespace: testNamespace,
 		RoleName:         hdfsv1alpha1.NameNodeRoleName,
 		ResourceName:     "simple-hdfs-namenode-default",
 	}
@@ -340,15 +359,24 @@ func TestHTTPSContainerPort(t *testing.T) {
 	}
 }
 
-func TestRoleSidecarManager(t *testing.T) {
+func TestRegisterRoleSidecars(t *testing.T) {
 	cr := crWithNameNodes()
-	if roleSidecarManager(cr, hdfsv1alpha1.NameNodeRoleName, "/x") == nil {
-		t.Error("NameNode should have a sidecar manager (format + zkfc)")
+
+	nn := sidecar.NewSidecarManager()
+	registerRoleSidecars(cr, hdfsv1alpha1.NameNodeRoleName, "/x", nn)
+	if nn.Count() == 0 {
+		t.Error("NameNode should register init/sidecar containers (format-namenode/format-zk/zkfc)")
 	}
-	if roleSidecarManager(cr, hdfsv1alpha1.DataNodeRoleName, "/x") == nil {
-		t.Error("DataNode should have a sidecar manager (wait-for-namenodes)")
+
+	dn := sidecar.NewSidecarManager()
+	registerRoleSidecars(cr, hdfsv1alpha1.DataNodeRoleName, "/x", dn)
+	if dn.Count() == 0 {
+		t.Error("DataNode should register wait-for-namenodes")
 	}
-	if roleSidecarManager(cr, hdfsv1alpha1.JournalNodeRoleName, "/x") != nil {
-		t.Error("JournalNode should have no sidecar manager")
+
+	jn := sidecar.NewSidecarManager()
+	registerRoleSidecars(cr, hdfsv1alpha1.JournalNodeRoleName, "/x", jn)
+	if jn.Count() != 0 {
+		t.Error("JournalNode should register no extra containers")
 	}
 }

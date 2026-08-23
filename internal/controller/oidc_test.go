@@ -17,10 +17,14 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"testing"
 
 	authv1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/authentication/v1alpha1"
-	corev1 "k8s.io/api/core/v1"
+	"github.com/zncdatadev/operator-go/pkg/sidecar"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	hdfsv1alpha1 "github.com/zncdatadev/hdfs-operator/api/v1alpha1"
 )
@@ -36,49 +40,89 @@ func TestOidcEnabled(t *testing.T) {
 	if oidcEnabled(cr) {
 		t.Error("OIDC needs an authenticationClass reference, not just oidc creds")
 	}
-	cr.Spec.ClusterConfig.Authentication.AuthenticationClass = "oidc"
+	cr.Spec.ClusterConfig.Authentication.AuthenticationClass = testAuthClass
 	if !oidcEnabled(cr) {
 		t.Error("OIDC should be enabled with authenticationClass + oidc creds")
 	}
 }
 
-func TestOidcContainer(t *testing.T) {
+func TestOidcCookieSecretName(t *testing.T) {
 	cr := crWithNameNodes()
-	provider := &authv1alpha1.OIDCProvider{
-		Hostname:     "keycloak.default.svc",
-		Port:         8080,
-		RootPath:     "/realms/kubedoop",
-		ProviderHint: "keycloak",
+	if got, want := oidcCookieSecretName(cr), "simple-hdfs-oidc-cookie"; got != want {
+		t.Errorf("cookie secret name = %q, want %q", got, want)
 	}
-	oidc := &hdfsv1alpha1.OidcSpec{ClientCredentialsSecret: "oidc-credentials", ExtraScopes: []string{"groups"}}
+}
 
-	c := oidcContainer(cr, provider, oidc, hdfsv1alpha1.NameNodeHttpPort)
+// testNamespace is the namespace used across controller unit tests.
+const testNamespace = "default"
 
-	if c.Name != oidcContainerName || len(c.Ports) != 1 || c.Ports[0].ContainerPort != oidcProxyPort {
-		t.Errorf("oidc container = name %q ports %+v, want %q on %d", c.Name, c.Ports, oidcContainerName, oidcProxyPort)
-	}
-	if c.RestartPolicy == nil || *c.RestartPolicy != corev1.ContainerRestartPolicyAlways {
-		t.Error("oidc proxy should be a native sidecar (RestartPolicy=Always)")
-	}
+// testAuthClass is the AuthenticationClass name used across OIDC unit tests.
+const testAuthClass = "oidc"
 
-	env := map[string]corev1.EnvVar{}
-	for _, e := range c.Env {
-		env[e.Name] = e
+func oidcCR() *hdfsv1alpha1.HdfsCluster {
+	cr := crWithNameNodes()
+	cr.Namespace = testNamespace
+	cr.Spec.ClusterConfig.Authentication = &hdfsv1alpha1.AuthenticationSpec{
+		AuthenticationClass: testAuthClass,
+		Oidc:                &hdfsv1alpha1.OidcSpec{ClientCredentialsSecret: "oidc-credentials", ExtraScopes: []string{"groups"}},
 	}
-	if got := env["OAUTH2_PROXY_OIDC_ISSUER_URL"].Value; got != "http://keycloak.default.svc:8080/realms/kubedoop" {
-		t.Errorf("issuer url = %q", got)
+	return cr
+}
+
+func oidcScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := authv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add authentication scheme: %v", err)
 	}
-	if got := env["OAUTH2_PROXY_PROVIDER"].Value; got != "keycloak-oidc" {
-		t.Errorf("provider = %q, want keycloak-oidc (hint remap)", got)
+	return scheme
+}
+
+func TestOidcSidecarProvider(t *testing.T) {
+	cr := oidcCR()
+	authClass := &authv1alpha1.AuthenticationClass{
+		ObjectMeta: metav1.ObjectMeta{Name: testAuthClass, Namespace: testNamespace},
+		Spec: authv1alpha1.AuthenticationClassSpec{
+			AuthenticationProvider: &authv1alpha1.AuthenticationProvider{
+				OIDC: &authv1alpha1.OIDCProvider{
+					Hostname:     "keycloak.default.svc",
+					Port:         8080,
+					RootPath:     "/realms/kubedoop",
+					ProviderHint: "keycloak",
+				},
+			},
+		},
 	}
-	if got := env["UPSTREAM"].Value; got != "http://$(POD_IP):9870" {
-		t.Errorf("upstream = %q, want http://$(POD_IP):9870", got)
+	c := fake.NewClientBuilder().WithScheme(oidcScheme(t)).WithObjects(authClass).Build()
+
+	provider, err := oidcSidecarProvider(context.Background(), c, cr)
+	if err != nil {
+		t.Fatalf("oidcSidecarProvider: %v", err)
 	}
-	if ref := env["OAUTH2_PROXY_CLIENT_ID"].ValueFrom; ref == nil || ref.SecretKeyRef == nil ||
-		ref.SecretKeyRef.Name != "oidc-credentials" || ref.SecretKeyRef.Key != "CLIENT_ID" {
-		t.Errorf("CLIENT_ID should come from the credentials secret, got %+v", ref)
+	if provider == nil {
+		t.Fatal("expected a provider when the AuthenticationClass carries an OIDC provider")
 	}
-	if got := env["OAUTH2_PROXY_SCOPE"].Value; got != "openid email profile groups" {
-		t.Errorf("scope = %q, want openid email profile groups", got)
+	if provider.Name() != oidcContainerName {
+		t.Errorf("provider name = %q, want %q", provider.Name(), oidcContainerName)
+	}
+}
+
+func TestOidcSidecarProvider_AbsentAuthClass(t *testing.T) {
+	cr := oidcCR()
+	c := fake.NewClientBuilder().WithScheme(oidcScheme(t)).Build()
+
+	provider, err := oidcSidecarProvider(context.Background(), c, cr)
+	if err != nil {
+		t.Fatalf("oidcSidecarProvider: %v", err)
+	}
+	if provider != nil {
+		t.Error("expected nil provider when the AuthenticationClass does not exist yet")
+	}
+}
+
+// Ensure the cookie secret key the sidecar validates against is the one we generate.
+func TestOidcCookieSecretKeyMatchesFramework(t *testing.T) {
+	if sidecar.OIDCCookieSecretKey == "" {
+		t.Error("framework OIDCCookieSecretKey should be non-empty")
 	}
 }

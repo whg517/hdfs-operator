@@ -25,54 +25,52 @@ import (
 	hdfsv1alpha1 "github.com/zncdatadev/hdfs-operator/api/v1alpha1"
 )
 
-func TestDefault_FillsImageDefaults(t *testing.T) {
-	cr := &hdfsv1alpha1.HdfsCluster{}
-	if err := (&HdfsClusterCustomDefaulter{}).Default(context.Background(), cr); err != nil {
-		t.Fatalf("Default() error: %v", err)
+func TestValidateCreate_ResolvableImages(t *testing.T) {
+	const productVersion = "3.4.1"
+	cases := []struct {
+		name  string
+		image *commonsv1alpha1.ImageSpec
+	}{
+		{"nil image (handler defaults it)", nil},
+		{"productVersion only (handler fills the rest)", &commonsv1alpha1.ImageSpec{ProductVersion: productVersion}},
+		{"full structured image", &commonsv1alpha1.ImageSpec{Repo: "quay.io/zncdatadev", ProductVersion: productVersion, KubedoopVersion: "0.0.0-dev"}},
+		{"valid custom image", &commonsv1alpha1.ImageSpec{Custom: "example.com/hadoop:custom"}},
 	}
-	img := cr.Spec.Image
-	if img == nil {
-		t.Fatal("image should be initialized")
-	}
-	if img.Repo != hdfsv1alpha1.DefaultRepository {
-		t.Errorf("repo = %q, want %q", img.Repo, hdfsv1alpha1.DefaultRepository)
-	}
-	if img.ProductVersion != hdfsv1alpha1.DefaultProductVersion {
-		t.Errorf("productVersion = %q, want %q", img.ProductVersion, hdfsv1alpha1.DefaultProductVersion)
-	}
-	if img.KubedoopVersion != hdfsv1alpha1.DefaultKubedoopVersion {
-		t.Errorf("kubedoopVersion = %q, want %q", img.KubedoopVersion, hdfsv1alpha1.DefaultKubedoopVersion)
-	}
-}
-
-func TestDefault_KeepsUserValues(t *testing.T) {
-	cr := &hdfsv1alpha1.HdfsCluster{
-		Spec: hdfsv1alpha1.HdfsClusterSpec{
-			Image: &commonsv1alpha1.ImageSpec{Repo: "my-repo", ProductVersion: "3.3.6"},
-		},
-	}
-	if err := (&HdfsClusterCustomDefaulter{}).Default(context.Background(), cr); err != nil {
-		t.Fatalf("Default() error: %v", err)
-	}
-	if cr.Spec.Image.Repo != "my-repo" || cr.Spec.Image.ProductVersion != "3.3.6" {
-		t.Errorf("user-set repo/version must be preserved, got %+v", cr.Spec.Image)
-	}
-	// only the missing field is filled
-	if cr.Spec.Image.KubedoopVersion != hdfsv1alpha1.DefaultKubedoopVersion {
-		t.Errorf("missing kubedoopVersion should be defaulted, got %q", cr.Spec.Image.KubedoopVersion)
+	v := &HdfsClusterCustomValidator{}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cr := &hdfsv1alpha1.HdfsCluster{Spec: hdfsv1alpha1.HdfsClusterSpec{Image: tc.image}}
+			if _, err := v.ValidateCreate(context.Background(), cr); err != nil {
+				t.Errorf("ValidateCreate() unexpected error: %v", err)
+			}
+		})
 	}
 }
 
-func TestDefault_CustomImageUntouched(t *testing.T) {
+func TestValidateCreate_InvalidCustomImage(t *testing.T) {
 	cr := &hdfsv1alpha1.HdfsCluster{
 		Spec: hdfsv1alpha1.HdfsClusterSpec{
-			Image: &commonsv1alpha1.ImageSpec{Custom: "example.com/hdfs:custom"},
+			Image: &commonsv1alpha1.ImageSpec{Custom: "INVALID IMAGE!"},
 		},
 	}
-	if err := (&HdfsClusterCustomDefaulter{}).Default(context.Background(), cr); err != nil {
-		t.Fatalf("Default() error: %v", err)
+	if _, err := (&HdfsClusterCustomValidator{}).ValidateCreate(context.Background(), cr); err == nil {
+		t.Error("ValidateCreate() should reject a malformed custom image")
 	}
-	if cr.Spec.Image.Repo != "" || cr.Spec.Image.ProductVersion != "" {
-		t.Errorf("a fully custom image must not get repo/version defaults, got %+v", cr.Spec.Image)
+}
+
+func TestValidateUpdate_ImageImmutable(t *testing.T) {
+	oldCR := &hdfsv1alpha1.HdfsCluster{
+		Spec: hdfsv1alpha1.HdfsClusterSpec{Image: &commonsv1alpha1.ImageSpec{ProductVersion: "3.4.1"}},
+	}
+	newCR := &hdfsv1alpha1.HdfsCluster{
+		Spec: hdfsv1alpha1.HdfsClusterSpec{Image: &commonsv1alpha1.ImageSpec{ProductVersion: "3.3.6"}},
+	}
+	if _, err := (&HdfsClusterCustomValidator{}).ValidateUpdate(context.Background(), oldCR, newCR); err == nil {
+		t.Error("ValidateUpdate() should reject a change to spec.image")
+	}
+
+	// Same image on both sides is allowed.
+	if _, err := (&HdfsClusterCustomValidator{}).ValidateUpdate(context.Background(), oldCR, oldCR.DeepCopy()); err != nil {
+		t.Errorf("ValidateUpdate() with unchanged image: unexpected error: %v", err)
 	}
 }

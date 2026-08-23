@@ -19,6 +19,8 @@ limitations under the License.
 // operator applies when the user does not override them via the CR.
 package constants
 
+import commonsv1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/commons/v1alpha1"
+
 // Product image defaults. The container image is modeled by the SDK
 // commonsv1alpha1.ImageSpec; these supply the product defaults used to build the
 // operator's fallback image reference ({Repo}/{ProductName}:{ProductVersion}-kubedoop{KubedoopVersion}).
@@ -28,6 +30,17 @@ const (
 	DefaultProductVersion  = "3.4.1"
 	DefaultKubedoopVersion = "0.0.0-dev"
 )
+
+// ImageDefaults is the ImageSpec the handler folds under spec.image every reconcile, and the
+// webhook validates against. Kept in one place so the resolved image never disagrees between the
+// two (operator-go #581).
+func ImageDefaults() commonsv1alpha1.ImageSpec {
+	return commonsv1alpha1.ImageSpec{
+		Repo:            DefaultImageRepo,
+		ProductVersion:  DefaultProductVersion,
+		KubedoopVersion: DefaultKubedoopVersion,
+	}
+}
 
 // Primary container names per role. The SDK BaseRoleGroupHandler renames the primary
 // container (via MainContainerName) and keys per-container logging on these names.

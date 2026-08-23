@@ -18,27 +18,21 @@ package controller
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"fmt"
-	"net/url"
-	"strconv"
-	"strings"
 
 	authv1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/authentication/v1alpha1"
+	"github.com/zncdatadev/operator-go/pkg/reconciler"
+	"github.com/zncdatadev/operator-go/pkg/sidecar"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/utils/ptr"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	hdfsv1alpha1 "github.com/zncdatadev/hdfs-operator/api/v1alpha1"
+	"github.com/zncdatadev/hdfs-operator/internal/constants"
 )
 
-const (
-	oidcContainerName = "oidc"
-	// oidcProxyPort is the port oauth2-proxy listens on; it fronts the NameNode web UI.
-	oidcProxyPort int32 = 4180
-)
+// oidcContainerName is the oauth2-proxy sidecar container name. Kept as "oidc" (the framework
+// default is "oauth2-proxy") so the rendered NameNode pod is unchanged for existing clusters.
+const oidcContainerName = "oidc"
 
 // oidcEnabled reports whether the CR requests OIDC (an AuthenticationClass reference plus the
 // client credentials secret).
@@ -49,10 +43,28 @@ func oidcEnabled(cr *hdfsv1alpha1.HdfsCluster) bool {
 		cr.Spec.ClusterConfig.Authentication.AuthenticationClass != ""
 }
 
-// oidcSidecar fetches the referenced AuthenticationClass and, when it carries an OIDC provider,
-// builds the oauth2-proxy sidecar that fronts the NameNode web UI. Returns (nil, nil) when OIDC is
-// not configured or the AuthenticationClass/provider is absent.
-func oidcSidecar(ctx context.Context, c ctrlclient.Client, cr *hdfsv1alpha1.HdfsCluster) (*corev1.Container, error) {
+// oidcCookieSecretName is the cluster-owned Secret holding the oauth2-proxy session cookie secret.
+func oidcCookieSecretName(cr *hdfsv1alpha1.HdfsCluster) string {
+	return cr.Name + "-oidc-cookie"
+}
+
+// ensureOidcCookieSecret creates (once) the generated session-cookie Secret the oauth2-proxy
+// sidecar signs sessions with. reconciler.EnsureGeneratedSecret generates the value only when the
+// Secret is absent and never re-converges it, so restarts and re-reconciles keep every existing
+// session valid. Replaces the old UID-derived cookie, which baked a deterministic secret into the
+// pod spec.
+func ensureOidcCookieSecret(ctx context.Context, c ctrlclient.Client, cr *hdfsv1alpha1.HdfsCluster) error {
+	_, err := reconciler.EnsureGeneratedSecret(ctx, c, c.Scheme(), cr, oidcCookieSecretName(cr),
+		map[string]func() (string, error){sidecar.OIDCCookieSecretKey: sidecar.GenerateCookieSecret},
+		reconciler.WithGeneratedSecretProductName(constants.ProductName),
+	)
+	return err
+}
+
+// oidcSidecarProvider builds the framework oauth2-proxy sidecar that fronts the NameNode web UI.
+// It returns (nil, nil) when OIDC is not configured or the referenced AuthenticationClass / OIDC
+// provider is absent (a later reconcile picks it up once created).
+func oidcSidecarProvider(ctx context.Context, c ctrlclient.Client, cr *hdfsv1alpha1.HdfsCluster) (*sidecar.OAuth2ProxySidecarProvider, error) {
 	if !oidcEnabled(cr) {
 		return nil, nil
 	}
@@ -70,71 +82,19 @@ func oidcSidecar(ctx context.Context, c ctrlclient.Client, cr *hdfsv1alpha1.Hdfs
 		return nil, nil
 	}
 
-	container := oidcContainer(cr, authClass.Spec.AuthenticationProvider.OIDC, auth.Oidc, hdfsv1alpha1.NameNodeHttpPort)
-	return &container, nil
-}
-
-// oidcContainer builds the oauth2-proxy container that proxies OIDC-authenticated traffic to the
-// local NameNode web UI (upstream). Modeled on the pre-refactor implementation.
-func oidcContainer(cr *hdfsv1alpha1.HdfsCluster, provider *authv1alpha1.OIDCProvider, oidc *hdfsv1alpha1.OidcSpec, upstreamPort int32) corev1.Container {
-	return corev1.Container{
-		Name:    oidcContainerName,
-		Image:   resolveImage(cr),
-		Command: []string{"sh", "-c"},
-		Args:    []string{"/kubedoop/oauth2-proxy/oauth2-proxy --upstream=${UPSTREAM}"},
-		Env:     oidcEnv(cr, provider, oidc, upstreamPort),
-		Ports: []corev1.ContainerPort{
-			{Name: oidcContainerName, ContainerPort: oidcProxyPort, Protocol: corev1.ProtocolTCP},
-		},
-		// Native sidecar: oauth2-proxy runs for the pod's lifetime.
-		RestartPolicy: ptr.To(corev1.ContainerRestartPolicyAlways),
-	}
-}
-
-// oidcEnv builds the OAUTH2_PROXY_* environment for the sidecar.
-func oidcEnv(cr *hdfsv1alpha1.HdfsCluster, provider *authv1alpha1.OIDCProvider, oidc *hdfsv1alpha1.OidcSpec, upstreamPort int32) []corev1.EnvVar {
-	scopes := make([]string, 0, 3+len(oidc.ExtraScopes))
-	scopes = append(scopes, "openid", "email", "profile")
-	scopes = append(scopes, oidc.ExtraScopes...)
-
-	issuer := url.URL{Scheme: "http", Host: provider.Hostname, Path: provider.RootPath}
-	if provider.Port != 0 && provider.Port != 80 {
-		issuer.Host += ":" + strconv.Itoa(provider.Port)
-	}
-
-	providerHint := provider.ProviderHint
-	if providerHint == "keycloak" {
-		providerHint = "keycloak-oidc"
-	}
-
-	secretRef := func(key string) *corev1.EnvVarSource {
-		return &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-			LocalObjectReference: corev1.LocalObjectReference{Name: oidc.ClientCredentialsSecret},
-			Key:                  key,
-		}}
-	}
-
-	return []corev1.EnvVar{
-		{Name: "OAUTH2_PROXY_COOKIE_SECRET", Value: oidcCookieSecret(cr)},
-		{Name: "OAUTH2_PROXY_CLIENT_ID", ValueFrom: secretRef("CLIENT_ID")},
-		{Name: "OAUTH2_PROXY_CLIENT_SECRET", ValueFrom: secretRef("CLIENT_SECRET")},
-		{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"}}},
-		{Name: "OAUTH2_PROXY_OIDC_ISSUER_URL", Value: issuer.String()},
-		{Name: "OAUTH2_PROXY_SCOPE", Value: strings.Join(scopes, " ")},
-		{Name: "OAUTH2_PROXY_PROVIDER", Value: providerHint},
-		{Name: "UPSTREAM", Value: fmt.Sprintf("http://$(POD_IP):%d", upstreamPort)},
-		{Name: "OAUTH2_PROXY_HTTP_ADDRESS", Value: "0.0.0.0:" + strconv.Itoa(int(oidcProxyPort))},
-		{Name: "OAUTH2_PROXY_CODE_CHALLENGE_METHOD", Value: "S256"},
-		{Name: "OAUTH2_PROXY_EMAIL_DOMAINS", Value: "*"},
-		{Name: "OAUTH2_PROXY_COOKIE_SECURE", Value: "false"},
-		{Name: "OAUTH2_PROXY_WHITELIST_DOMAINS", Value: "*"},
-	}
-}
-
-// oidcCookieSecret derives a stable oauth2-proxy cookie secret from the cluster UID, so it is
-// deterministic across reconciles without persisting a generated secret.
-func oidcCookieSecret(cr *hdfsv1alpha1.HdfsCluster) string {
-	hash := sha256.Sum256([]byte(string(cr.UID)))
-	token := hex.EncodeToString(hash[:])[:16]
-	return base64.StdEncoding.EncodeToString([]byte(base64.StdEncoding.EncodeToString([]byte(token))))
+	return sidecar.NewOAuth2ProxySidecarProvider(
+		authClass.Spec.AuthenticationProvider.OIDC,
+		auth.Oidc.ClientCredentialsSecret,
+		hdfsv1alpha1.NameNodeHttpPort,
+		sidecar.WithOAuth2ProxyContainerName(oidcContainerName),
+		sidecar.WithOAuth2ProxyExtraScopes(auth.Oidc.ExtraScopes...),
+		// The IdP realm is dedicated to this cluster, so every authenticated account is allowed.
+		// Spelled out (not a default) per the framework's authorization contract; preserves the
+		// pre-refactor behaviour (OAUTH2_PROXY_EMAIL_DOMAINS="*").
+		sidecar.WithOAuth2ProxyAllowAllEmails(),
+		sidecar.WithOAuth2ProxyCookieSecretRef(&corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: oidcCookieSecretName(cr)},
+			Key:                  sidecar.OIDCCookieSecretKey,
+		}),
+	), nil
 }

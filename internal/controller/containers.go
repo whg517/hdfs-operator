@@ -21,6 +21,7 @@ import (
 	"path"
 	"strings"
 
+	commonsv1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/commons/v1alpha1"
 	"github.com/zncdatadev/operator-go/pkg/builder"
 	"github.com/zncdatadev/operator-go/pkg/constant"
 	"github.com/zncdatadev/operator-go/pkg/reconciler"
@@ -106,15 +107,32 @@ func httpsContainerPort(roleName string) *corev1.ContainerPort {
 	return &corev1.ContainerPort{Name: hdfsv1alpha1.HttpsName, ContainerPort: port, Protocol: corev1.ProtocolTCP}
 }
 
-// resolveImage returns the CR-driven image (resolved with the product name), or the operator
-// default when the CR does not set spec.image.
+// resolveImage returns the image the init/sidecar static containers run. It folds spec.image over
+// ImageDefaults with the framework resolver (operator-go #581) — the SAME inputs the handler gives
+// the main container — so the init containers can never land on a different tag than the daemon
+// they set up. It resolves explicitly (rather than relying on the framework's sidecar
+// SetProductImage) because StaticContainerProvider injects its container verbatim and ignores the
+// propagated SidecarConfig image.
 func resolveImage(cr *hdfsv1alpha1.HdfsCluster) string {
-	if cr.Spec.Image != nil {
-		if img := cr.Spec.Image.GetImage(constants.ProductName); img != "" {
-			return img
-		}
+	spec := cr.Spec.Image
+	if spec == nil {
+		spec = &commonsv1alpha1.ImageSpec{}
+	}
+	if img, err := spec.ResolveImage(constants.ProductName, constants.ImageDefaults()); err == nil && img != "" {
+		return img
 	}
 	return defaultImage()
+}
+
+// defaultImage is the operator's fallback HDFS image, built from the product defaults. resolveImage
+// falls back to it only when spec.image cannot resolve.
+func defaultImage() string {
+	return fmt.Sprintf("%s/%s:%s-kubedoop%s",
+		constants.DefaultImageRepo,
+		constants.ProductName,
+		constants.DefaultProductVersion,
+		constants.DefaultKubedoopVersion,
+	)
 }
 
 // exportPodAddressScript reads the pod's externally reachable address and ports from the listener
@@ -181,7 +199,7 @@ func newContainer(name string, cr *hdfsv1alpha1.HdfsCluster, confDir, script str
 	c := corev1.Container{
 		Name:         name,
 		Image:        resolveImage(cr),
-		Command:      []string{"/bin/bash", "-c"},
+		Command:      []string{bashShell, "-c"},
 		Args:         []string{script},
 		Env:          commonEnv(cr, confDir),
 		VolumeMounts: mounts,

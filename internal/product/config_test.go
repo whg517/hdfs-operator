@@ -17,14 +17,57 @@ limitations under the License.
 package product
 
 import (
+	"context"
+	"strings"
 	"testing"
 
 	commonsv1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/commons/v1alpha1"
+	"github.com/zncdatadev/operator-go/pkg/reconciler"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
 	hdfsv1alpha1 "github.com/zncdatadev/hdfs-operator/api/v1alpha1"
 )
+
+func TestJvmOptsEnvVars(t *testing.T) {
+	cfg := func(mem string) *commonsv1alpha1.RoleGroupConfigSpec {
+		q := resource.MustParse(mem)
+		return &commonsv1alpha1.RoleGroupConfigSpec{
+			Resources: &commonsv1alpha1.ResourcesSpec{Memory: &commonsv1alpha1.MemoryResource{Limit: &q}},
+		}
+	}
+
+	// NameNode with a 2Gi limit: -Xmx (2Gi*0.8/1Mi = 1638) + the jmx javaagent on port 8183.
+	nn := jvmOptsEnvVars(hdfsv1alpha1.NameNodeRoleName, cfg("2Gi"))
+	if got := nn["HDFS_NAMENODE_OPTS"]; !strings.Contains(got, "-Xmx1638m") ||
+		!strings.Contains(got, "=8183:/kubedoop/jmx/namenode.yaml") {
+		t.Errorf("namenode opts = %q, want -Xmx1638m + jmx javaagent on 8183", got)
+	}
+
+	// No memory limit: no -Xmx, but the javaagent is still added on the datanode port.
+	dn := jvmOptsEnvVars(hdfsv1alpha1.DataNodeRoleName, nil)
+	if got := dn["HDFS_DATANODE_OPTS"]; strings.Contains(got, "-Xmx") || !strings.Contains(got, "=8082:/kubedoop/jmx/datanode.yaml") {
+		t.Errorf("no-limit datanode opts = %q, want jmx on 8082 and no -Xmx", got)
+	}
+
+	// Unknown role -> empty.
+	if got := jvmOptsEnvVars("unknown", cfg("2Gi")); len(got) != 0 {
+		t.Errorf("unknown role should yield no env, got %+v", got)
+	}
+}
+
+// mustCompute runs ComputeConfig for the default role group and returns the contribution, failing
+// the calling test on the never-expected error. A minimal build context supplies the role name; the
+// effective config is empty, which is all these config-content assertions need.
+func mustCompute(cr *hdfsv1alpha1.HdfsCluster, roleName string) *reconciler.Contribution {
+	rg := &reconciler.RoleGroupBuildContext{RoleName: roleName, RoleGroupName: defaultGroup}
+	out, err := ComputeConfig(context.Background(), nil, cr, rg)
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
 
 // defaultGroup / clusterName are fixtures used throughout these tests.
 const (
@@ -54,7 +97,7 @@ func testCluster() *hdfsv1alpha1.HdfsCluster {
 }
 
 func TestComputeConfig_CoreSite(t *testing.T) {
-	got := ComputeConfig(testCluster(), hdfsv1alpha1.NameNodeRoleName, defaultGroup).ConfigOverrides["core-site.xml"]
+	got := mustCompute(testCluster(), hdfsv1alpha1.NameNodeRoleName).ConfigOverrides["core-site.xml"]
 	want := map[string]string{
 		"fs.defaultFS":        "hdfs://simple-hdfs/",
 		"ha.zookeeper.quorum": "${env.ZOOKEEPER}",
@@ -71,7 +114,7 @@ func TestComputeConfig_TLS(t *testing.T) {
 	cr.Spec.ClusterConfig.Authentication = &hdfsv1alpha1.AuthenticationSpec{
 		Tls: &hdfsv1alpha1.TlsSpec{SecretClass: "tls", JksPassword: "secret123"},
 	}
-	out := ComputeConfig(cr, hdfsv1alpha1.NameNodeRoleName, defaultGroup).ConfigOverrides
+	out := mustCompute(cr, hdfsv1alpha1.NameNodeRoleName).ConfigOverrides
 
 	if got := out["hdfs-site.xml"]["dfs.http.policy"]; got != "HTTPS_ONLY" {
 		t.Errorf("dfs.http.policy = %q, want HTTPS_ONLY", got)
@@ -104,7 +147,7 @@ func TestComputeConfig_TLS(t *testing.T) {
 }
 
 func TestComputeConfig_NoTLS_NoHTTPSAddress(t *testing.T) {
-	out := ComputeConfig(testCluster(), hdfsv1alpha1.NameNodeRoleName, defaultGroup).ConfigOverrides
+	out := mustCompute(testCluster(), hdfsv1alpha1.NameNodeRoleName).ConfigOverrides
 	for k := range out["hdfs-site.xml"] {
 		if len(k) >= 24 && k[:24] == "dfs.namenode.https-addre" {
 			t.Errorf("https-address keys should be absent without TLS, found %q", k)
@@ -113,7 +156,7 @@ func TestComputeConfig_NoTLS_NoHTTPSAddress(t *testing.T) {
 }
 
 func TestComputeConfig_NoTLS(t *testing.T) {
-	out := ComputeConfig(testCluster(), hdfsv1alpha1.NameNodeRoleName, defaultGroup).ConfigOverrides
+	out := mustCompute(testCluster(), hdfsv1alpha1.NameNodeRoleName).ConfigOverrides
 	if _, ok := out["ssl-server.xml"]; ok {
 		t.Error("ssl-server.xml should be absent when TLS disabled")
 	}
@@ -153,7 +196,7 @@ func TestComputeConfig_Kerberos(t *testing.T) {
 	cr.Spec.ClusterConfig.Authentication = &hdfsv1alpha1.AuthenticationSpec{
 		Kerberos: &hdfsv1alpha1.KerberosSpec{SecretClass: "kerberos"},
 	}
-	out := ComputeConfig(cr, hdfsv1alpha1.NameNodeRoleName, defaultGroup).ConfigOverrides
+	out := mustCompute(cr, hdfsv1alpha1.NameNodeRoleName).ConfigOverrides
 
 	core := out["core-site.xml"]
 	if core["hadoop.security.authentication"] != "kerberos" {
@@ -172,7 +215,7 @@ func TestComputeConfig_Kerberos(t *testing.T) {
 }
 
 func TestComputeConfig_HdfsSiteHA(t *testing.T) {
-	got := ComputeConfig(testCluster(), hdfsv1alpha1.DataNodeRoleName, defaultGroup).ConfigOverrides["hdfs-site.xml"]
+	got := mustCompute(testCluster(), hdfsv1alpha1.DataNodeRoleName).ConfigOverrides["hdfs-site.xml"]
 
 	cases := map[string]string{
 		"dfs.nameservices":                  clusterName,

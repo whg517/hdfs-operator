@@ -46,18 +46,13 @@ func NewDiscoveryExtension() *DiscoveryExtension {
 }
 
 // PreReconcile is a no-op for discovery.
-func (e *DiscoveryExtension) PreReconcile(_ context.Context, _ client.Client, _ common.ClusterInterface) error {
+func (e *DiscoveryExtension) PreReconcile(_ context.Context, _ client.Client, _ *hdfsv1alpha1.HdfsCluster) error {
 	return nil
 }
 
 // PostReconcile renders the discovery config and applies the ConfigMap via the SDK's shared
 // ensure-helper (idempotent CreateOrUpdate + owner reference + canonical labels).
-func (e *DiscoveryExtension) PostReconcile(ctx context.Context, k8sClient client.Client, cr common.ClusterInterface) error {
-	hdfs, ok := cr.(*hdfsv1alpha1.HdfsCluster)
-	if !ok {
-		return fmt.Errorf("expected *HdfsCluster, got %T", cr)
-	}
-
+func (e *DiscoveryExtension) PostReconcile(ctx context.Context, k8sClient client.Client, hdfs *hdfsv1alpha1.HdfsCluster) error {
 	generator := config.NewMultiFormatConfigGenerator()
 	generator.RegisterDefaultFormats()
 	data, err := generator.GenerateFiles(product.DiscoveryConfig(hdfs))
@@ -71,9 +66,9 @@ func (e *DiscoveryExtension) PostReconcile(ctx context.Context, k8sClient client
 }
 
 // OnReconcileError is a no-op for discovery.
-func (e *DiscoveryExtension) OnReconcileError(_ context.Context, _ client.Client, _ common.ClusterInterface, _ error) error {
+func (e *DiscoveryExtension) OnReconcileError(_ context.Context, _ client.Client, _ *hdfsv1alpha1.HdfsCluster, _ error) error {
 	return nil
 }
 
 // Ensure DiscoveryExtension satisfies the SDK ClusterExtension contract.
-var _ common.ClusterExtension[common.ClusterInterface] = &DiscoveryExtension{}
+var _ common.ClusterExtension[*hdfsv1alpha1.HdfsCluster] = &DiscoveryExtension{}
